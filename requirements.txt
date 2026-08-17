@@ -1,0 +1,16 @@
+# Core dependencies (scan-only install, no LLM stack)
+pydantic>=2.13,<3
+python-dotenv>=1.0,<2
+colorama>=0.4.6,<1
+rich>=13.0,<16
+fpdf2>=2.8,<3
+ruamel.yaml>=0.18.6
+setuptools>=82.0.1
+
+# AI analysis dependencies (the docksec[ai] extra)
+langchain-core>=1.3,<2
+langchain>=1.2,<2
+langchain-openai>=1.2,<2
+langchain-anthropic>=1.4,<2
+langchain-google-genai>=4.2,<5
+langchain-ollama>=1.1,<2

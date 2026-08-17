@@ -1,0 +1,41 @@
+---
+name: Question
+about: Ask a question about using DockSec
+title: '[QUESTION] '
+labels: question
+assignees: ''
+
+---
+
+## Question
+
+A clear and concise question.
+
+## Context
+
+**What are you trying to accomplish?**
+
+Describe what you're working on and what you're trying to achieve with DockSec.
+
+**What have you tried so far?**
+
+- Tried command: `docksec ...`
+- Checked documentation: [link]
+- Searched issues: [link]
+
+## Environment (if relevant)
+
+- DockSec version:
+- Operating System:
+- Python version:
+
+## Additional Information
+
+Any additional information that might help answer the question.
+
+---
+
+Before asking, please check:
+- [ ] [README documentation](https://github.com/OWASP/DockSec/blob/main/README.md)
+- [ ] [Existing issues](https://github.com/OWASP/DockSec/issues)
+- [ ] [Examples directory](https://github.com/OWASP/DockSec/tree/main/examples)

@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import argparse
+
+
+def get_version() -> str:
+    """Return the installed package version.
+
+    Resolution order:
+    1. importlib.metadata  — works when installed via pip
+    2. setup.py on disk    — works when running from source
+    3. 'unknown'           — last resort fallback
+    """
+    try:
+        from importlib.metadata import version
+        return version("docksec")
+    except Exception:  # package not installed; fall through to source fallback
+        pass
+
+    try:
+        import re
+        setup_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'setup.py')
+        with open(setup_path, 'r') as f:
+            match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', f.read())
+            if match:
+                return match.group(1)
+    except Exception:  # setup.py missing or unreadable; fall through to unknown
+        pass
+
+    return "unknown"
+
+def main() -> None:
+    """
+    Main entry point for the DockSec CLI tool.
+    Parses arguments and coordinates AI analysis and security scanning.
+    """
+    # Set CLI mode to suppress INFO logs for user-facing output
+    os.environ["DOCKSEC_CLI_MODE"] = "true"
+
+    # Subcommand dispatch (backward compatible): the historical CLI takes a
+    # positional Dockerfile, so we intercept known verbs as the first argument
+    # before argparse runs. Anything else falls through to the existing
+    # flag-based scan CLI unchanged.
+    if len(sys.argv) > 1 and sys.argv[1] == "install-skill":
+        from docksec import output
+        output.configure()
+        from docksec.install_skill import install_skill
+        install_skill()
+        return
+
+    from docksec.enums import LLMProvider
+    parser = argparse.ArgumentParser(description='Docker Security Analysis Tool')
+    parser.add_argument('dockerfile', nargs='?', help='Path to the Dockerfile to analyze (optional when using --image-only or --compose)')
+    parser.add_argument('-i', '--image', help='Docker image name to scan')
+    parser.add_argument('-c', '--compose', nargs='?', const='auto', help='Path to docker-compose file to scan. If no path is provided, auto-detects in current directory.')
+    parser.add_argument('--ai-only', action='store_true', help='Run only AI-based recommendations (requires Dockerfile)')
+    parser.add_argument('--scan-only', action='store_true', help='Run only Dockerfile/image scanning (requires --image)')
+    parser.add_argument('--image-only', action='store_true', help='Scan only the Docker image without Dockerfile analysis')
+    parser.add_argument('--provider', choices=LLMProvider.values(),
+                       help='LLM provider to use (default: openai, can also set LLM_PROVIDER env var)')
+    parser.add_argument('--model', help='Model name to use (e.g., gpt-4o, claude-haiku-4-5, gemini-1.5-pro, llama3.1)')
+    parser.add_argument('--compact-output', action='store_true', help='Use compact output format (less verbose)')
+    parser.add_argument('--skip-ai-scoring', action='store_true', help='Skip AI-based security scoring (use local scoring only)')
+    parser.add_argument('--severity', help='Comma-separated severity levels to scan for (default: CRITICAL,HIGH; or set DOCKSEC_DEFAULT_SEVERITY)')
+    parser.add_argument('--fail-on', dest='fail_on', metavar='SEVERITY', help='Exit with code 1 if any finding is at or above this severity (CRITICAL, HIGH, MEDIUM, or LOW)')
+    parser.add_argument('--format', dest='format', help='Comma-separated report formats to write: json, csv, pdf, html (default: all)')
+    parser.add_argument('--output-dir', dest='output_dir', metavar='DIR', help='Directory to write reports to (default: ~/.docksec/results or DOCKSEC_RESULTS_DIR)')
+    parser.add_argument('--json', dest='json_stdout', action='store_true', help='Print scan results as JSON to stdout (no report files unless --format is also given)')
+    parser.add_argument('--sarif', dest='sarif', action='store_true', help='Write a SARIF 2.1.0 report for GitHub Code Scanning and other SARIF-compatible tools')
+    parser.add_argument('--sbom', dest='sbom', action='store_true', help='Write a CycloneDX SBOM (.cdx.json) of the scanned image for supply-chain tooling (requires an image)')
+    parser.add_argument('--offline', dest='offline', action='store_true', help='Run without network access: use the local Trivy DB (no DB update) and skip AI analysis')
+    parser.add_argument('--no-redact', dest='no_redact', action='store_true', help='Do not mask secret-looking values before sending file content to the AI provider')
+    parser.add_argument('--no-cache', dest='no_cache', action='store_true', help='Bypass the scan results cache and force a fresh scan')
+    parser.add_argument('--ignore-file', dest='ignore_file', metavar='FILE', help='Path to an ignore file listing findings to suppress (default: .docksec-ignore.yml in the current directory, if present)')
+    parser.add_argument('--baseline', dest='baseline', metavar='FILE', help='Path to a baseline file; with --fail-on, only findings not present in the baseline trigger the gate')
+    parser.add_argument('--update-baseline', dest='update_baseline', action='store_true', help='Write the current scan findings to --baseline instead of gating against it')
+    parser.add_argument('--quiet', action='store_true', help='Reduce output to warnings, errors, and the result summary')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Show INFO-level log lines on stderr')
+    parser.add_argument('--log-file', dest='log_file', metavar='FILE', help='Also append log lines to FILE, creating missing parent directories; combine with --verbose to capture INFO-level logs')
+    parser.add_argument('--no-color', action='store_true', help='Disable colored output (also honors the NO_COLOR env var)')
+    parser.add_argument('--version', action='version', version=f'DockSec {get_version()}')
+
+    args = parser.parse_args()
+
+    # Configure the terminal output layer before anything is printed.
+    from docksec import output
+    no_color = args.no_color or bool(os.getenv("NO_COLOR"))
+    if no_color:
+        # Every Rich console (including the AI-findings console in utils) honors
+        # NO_COLOR, so set it before those modules are imported.
+        os.environ["NO_COLOR"] = "1"
+    output.configure(quiet=args.quiet, no_color=no_color, json_mode=args.json_stdout)
+
+    # Set provider and model from CLI args if provided (overrides env vars)
+    if args.provider:
+        os.environ["LLM_PROVIDER"] = args.provider
+    if args.model:
+        os.environ["LLM_MODEL"] = args.model
+
+    # Set compact output mode if requested
+    if args.compact_output:
+        os.environ["DOCKSEC_COMPACT_OUTPUT"] = "true"
+
+    # --no-cache: the scanner (and every per-service scanner in compose runs)
+    # reads DOCKSEC_USE_CACHE at construction time.
+    if args.no_cache:
+        os.environ["DOCKSEC_USE_CACHE"] = "false"
+
+    if args.verbose and not os.getenv("DOCKSEC_LOG_LEVEL"):
+        os.environ["DOCKSEC_LOG_LEVEL"] = "INFO"
+
+    # Resolve --log-file before any logger is built, so get_custom_logger can
+    # attach its file handler. Opening the path here surfaces an unwritable
+    # destination as a clean CLI error instead of a traceback mid-scan.
+    if args.log_file:
+        try:
+            parent = os.path.dirname(os.path.abspath(args.log_file))
+            os.makedirs(parent, exist_ok=True)
+            with open(args.log_file, 'a', encoding='utf-8'):
+                pass
+        except OSError as exc:
+            output.error(f"Cannot write to --log-file '{args.log_file}': {exc}")
+            sys.exit(2)
+        os.environ["DOCKSEC_LOG_FILE"] = args.log_file
+
+    # Resolve the severity filter: CLI flag > DOCKSEC_DEFAULT_SEVERITY env > default.
+    from docksec.config_manager import get_config
+    from docksec.enums import Severity
+    severity = args.severity or get_config().default_severity
+    severity_list = [s.strip().upper() for s in severity.split(',') if s.strip()]
+    invalid_severities = [s for s in severity_list if s not in Severity.values()]
+    if not severity_list or invalid_severities:
+        output.error(
+            f"Invalid --severity value '{severity}'. "
+            f"Valid levels: {', '.join(Severity.values())}"
+        )
+        sys.exit(2)
+    severity = ','.join(severity_list)
+
+    # Validate --fail-on and widen the scan severity so the gate can see the
+    # levels it needs (e.g. --fail-on medium with the default CRITICAL,HIGH scan
+    # would otherwise never observe MEDIUM findings). Compose static findings are
+    # always emitted at all severities, so widening only affects the image scan.
+    if args.fail_on:
+        args.fail_on = args.fail_on.strip().upper()
+        if args.fail_on not in Severity.gate_levels():
+            output.error(
+                f"Invalid --fail-on value '{args.fail_on}'. "
+                f"Choose one of: {', '.join(Severity.gate_levels())}"
+            )
+            sys.exit(2)
+        needed = {lvl for lvl in Severity.gate_levels()
+                  if Severity.rank(lvl) >= Severity.rank(args.fail_on)}
+        widened = set(severity_list) | needed
+        if widened != set(severity_list):
+            severity_list = [lvl for lvl in Severity.values() if lvl in widened]
+            severity = ','.join(severity_list)
+            output.info(f"Widened scan severity to {severity} to satisfy --fail-on {args.fail_on}")
+
+    # Resolve report formats and output directory.
+    from docksec.config import RESULTS_DIR
+    valid_formats = ["json", "csv", "pdf", "html"]
+    report_formats = None  # None = write all formats (default)
+    if args.format:
+        requested = [f.strip().lower() for f in args.format.split(',') if f.strip()]
+        invalid_formats = [f for f in requested if f not in valid_formats]
+        if not requested or invalid_formats:
+            output.error(
+                f"Invalid --format value '{args.format}'. "
+                f"Valid formats: {', '.join(valid_formats)}"
+            )
+            sys.exit(2)
+        # Preserve a stable order and drop duplicates.
+        report_formats = [f for f in valid_formats if f in requested]
+    elif args.json_stdout:
+        # --json alone means "just print JSON to stdout" - it does not also
+        # write the report file bundle unless the user explicitly asks via
+        # --format. Passing an empty list writes nothing.
+        report_formats = []
+    output_dir = args.output_dir or RESULTS_DIR
+
+    # Validate argument combinations
+    if args.update_baseline and not args.baseline:
+        output.error("--update-baseline requires --baseline FILE")
+        sys.exit(2)
+
+    if args.image_only and args.ai_only:
+        output.error("--image-only and --ai-only cannot be used together (AI analysis requires a Dockerfile)")
+        sys.exit(2)
+    
+    if args.image_only and args.scan_only:
+        output.error("--image-only and --scan-only cannot be used together (use --image-only for image-only scanning)")
+        sys.exit(2)
+    
+    # Validate Dockerfile requirement
+    if not args.image_only and not args.compose and not args.dockerfile:
+        output.error("Dockerfile path is required unless using --image-only or --compose")
+        print("Usage examples:")
+        print("  docksec Dockerfile -i myapp:latest          # Analyze both Dockerfile and image")
+        print("  docksec --image-only -i myapp:latest        # Scan only the image")
+        print("  docksec --compose docker-compose.yml        # Scan compose file and its services")
+        print("  docksec --ai-only Dockerfile                # AI analysis only")
+        print("  docksec install-skill                       # Install AI-assistant skill files")
+        sys.exit(2)
+    
+    # Validate that the Dockerfile exists (if provided)
+    if args.dockerfile and not os.path.isfile(args.dockerfile):
+        output.error(f"Dockerfile not found at {args.dockerfile}")
+        sys.exit(2)
+    
+    # Validate image requirement for image-based operations
+    if args.image_only and not args.image:
+        output.error("Image name is required for image-only scanning. Use -i/--image to specify the Docker image.")
+        print("Example: docksec --image-only -i myapp:latest")
+        sys.exit(2)
+    
+    # In scan-only mode, if no image is provided, we'll only run Dockerfile analysis
+    if args.scan_only and not args.image and not args.compose:
+        output.info("No image provided for scan-only mode. Running Dockerfile analysis only.")
+    
+    # Determine which tools to run
+    if args.compose:
+        run_ai = not args.scan_only
+        run_scan = True
+        run_compose_analysis = True
+        mode_desc = "Compose Analysis"
+        
+        # Auto-detect compose file if needed
+        compose_path = args.compose
+        if compose_path == 'auto':
+            for name in ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']:
+                if os.path.isfile(name):
+                    compose_path = name
+                    break
+            if compose_path == 'auto':
+                output.error("Could not auto-detect a docker-compose file in the current directory.")
+                sys.exit(2)
+        
+        if not os.path.isfile(compose_path):
+            output.error(f"Compose file not found at {compose_path}")
+            sys.exit(2)
+            
+        args.compose = compose_path
+    elif args.image_only:
+        run_ai = False
+        run_scan = True
+        run_compose_analysis = False
+        mode_desc = "Image-only Scan"
+    elif args.ai_only:
+        run_ai = True
+        run_scan = False
+        run_compose_analysis = False
+        mode_desc = "AI Analysis Only"
+    elif args.scan_only:
+        run_ai = False
+        run_scan = True
+        run_compose_analysis = False
+        mode_desc = "Security Scan Only"
+    else:
+        # Default: run both AI and scan if both Dockerfile and image are provided
+        run_ai = bool(args.dockerfile)
+        run_scan = bool(args.image)
+        run_compose_analysis = False
+        mode_desc = "Full Analysis (AI + Scanner)"
+    
+    # Offline mode: no network calls. AI providers all require network (except
+    # a local Ollama, but we keep this simple and predictable), so --offline
+    # forces local scanning + local scoring only. The scan still runs against
+    # the already-downloaded Trivy DB.
+    if args.offline:
+        run_ai = False
+        mode_desc = f"{mode_desc} (offline)"
+
+    from docksec.config_manager import get_config
+    from docksec.enums import LLMProvider
+
+    output.banner(get_version(), mode_desc)
+    output.kv("Reports", output_dir)
+    if run_scan:
+        output.kv("Severity", severity)
+    if run_ai:
+        config = get_config()
+        output.kv("AI Provider", str(config.llm_provider))
+    
+    # Initialize AI findings storage
+    ai_findings = None
+    
+    # Run the AI-based recommendation tool
+    ai_ok = None  # None = AI not run, True = success, False = failed
+    if run_ai:
+        output.section("AI-based Dockerfile analysis")
+        try:
+            # Import required modules from main.py
+            from docksec.utils import (
+                load_docker_file,
+                get_llm,
+                analyze_security,
+                AnalyzesResponse
+            )
+            from docksec.config import docker_agent_prompt, truncate_dockerfile
+            from pathlib import Path
+            
+            # Set up the same components as main.py
+            llm = get_llm()
+            
+            # Use appropriate structured output method based on provider
+            config = get_config()
+            provider = config.llm_provider
+            
+            if provider == LLMProvider.OPENAI:
+                Report_llm = llm.with_structured_output(AnalyzesResponse, method="json_mode")
+            else:
+                # For Anthropic, Google, and Ollama, let LangChain choose the best method (usually tool calling)
+                Report_llm = llm.with_structured_output(AnalyzesResponse)
+                
+            analyser_chain = docker_agent_prompt | Report_llm
+            
+            # Load and analyze the file
+            if run_compose_analysis:
+                filecontent = load_docker_file(docker_file_path=Path(args.compose))
+                file_type = "docker-compose file"
+            else:
+                filecontent = load_docker_file(docker_file_path=Path(args.dockerfile))
+                file_type = "Dockerfile"
+            
+            if not filecontent:
+                output.error(f"No {file_type} content found.")
+                return
+
+            # Redact secret-looking values before the content leaves the
+            # machine. Keys stay visible so the model can still flag exposed
+            # credentials; the secret material itself is masked.
+            if not args.no_redact:
+                from docksec.redact import redact_content
+                filecontent, redacted_count = redact_content(filecontent)
+                if redacted_count:
+                    output.info(
+                        f"Masked {redacted_count} secret-looking value(s) before AI analysis "
+                        f"(--no-redact to disable)"
+                    )
+
+            # Cap very large inputs to bound token usage; warn when anything
+            # is dropped so a partial analysis is never mistaken for a full one.
+            if run_compose_analysis:
+                truncated_content = truncate_dockerfile(filecontent, max_lines=600, max_chars=24000)
+            else:
+                truncated_content = truncate_dockerfile(filecontent, max_lines=400, max_chars=16000)
+            if truncated_content != filecontent:
+                output.warn(
+                    f"{file_type} is very large; AI analysis covers only the first part "
+                    f"of the file. Scanner results (Trivy/Hadolint) are unaffected."
+                )
+
+            response = analyser_chain.invoke({"filecontent": truncated_content})
+            ai_findings = analyze_security(response, compact=True, report_path=output_dir)
+            ai_ok = True
+
+        except ImportError as e:
+            output.error(f"Required modules not found - {e}")
+            sys.exit(3)
+        except Exception as e:
+            output.error(f"AI analysis failed: {e}")
+            ai_ok = False
+    
+    # Run the scanner tool
+    scan_ok = None  # None = scan not run, True = success, False = failed
+    gate_triggered = False  # True when findings meet the --fail-on threshold
+    if run_scan:
+        scan_title = "Compose" if run_compose_analysis else ("Image" if args.image_only else "Full")
+        output.section(f"{scan_title} security scan")
+        try:
+            from docksec.docker_scanner import DockerSecurityScanner
+
+            if run_compose_analysis:
+                from docksec.compose_scanner import ComposeOrchestrator
+                orchestrator = ComposeOrchestrator(
+                    args.compose,
+                    scan_only=not run_ai,
+                    skip_ai_scoring=args.skip_ai_scoring
+                )
+                output.info(f"Scanning Compose file: {args.compose}")
+                results = orchestrator.run_full_scan(severity)
+
+                # We need a scanner instance just for scoring and reporting
+                scanner = DockerSecurityScanner(None, None, results_dir=output_dir, scan_only=not run_ai, skip_ai_scoring=args.skip_ai_scoring, offline=args.offline)
+                scanner.image_name = "Multiple Services"
+                scanner.dockerfile_path = args.compose
+            else:
+                # Initialize the scanner
+                dockerfile_path = None if args.image_only else args.dockerfile
+                scanner = DockerSecurityScanner(
+                    dockerfile_path,
+                    args.image,
+                    results_dir=output_dir,
+                    scan_only=not run_ai,
+                    skip_ai_scoring=args.skip_ai_scoring,
+                    offline=args.offline
+                )
+
+                # Run appropriate scan based on mode
+                if args.image_only:
+                    # Image-only scan - skip Dockerfile analysis
+                    output.info(f"Scanning Docker image: {args.image}")
+                    results = scanner.run_image_only_scan(severity)
+                else:
+                    # Full scan including Dockerfile
+                    results = scanner.run_full_scan(severity)
+
+            # Apply ignore-file suppressions before scoring, reports, JSON
+            # output, and the --fail-on gate see the findings.
+            ignore_path = args.ignore_file
+            if not ignore_path:
+                from docksec.ignore import find_default_ignore_file
+                ignore_path = find_default_ignore_file()
+            if ignore_path:
+                from docksec.ignore import load_ignore_file, apply_ignores
+                ignore_entries, ignore_warnings = load_ignore_file(ignore_path)
+                for warning in ignore_warnings:
+                    output.warn(warning)
+                kept_findings, suppressed_count = apply_ignores(
+                    results.get("json_data", []), ignore_entries)
+                if suppressed_count:
+                    results["json_data"] = kept_findings
+                    # Recorded so the reports and JSON payload can state that
+                    # findings were waived rather than silently absent.
+                    results["suppressed_count"] = suppressed_count
+                    results["ignore_file"] = ignore_path
+                    output.info(
+                        f"{suppressed_count} finding(s) suppressed by ignore file {ignore_path}"
+                    )
+
+            # Calculate security score
+            scanner.analysis_score = scanner.get_security_score(results)
+
+            # Add AI findings to results if available
+            if ai_findings:
+                results["ai_findings"] = ai_findings
+
+            # Generate reports (all formats by default, or the requested subset)
+            report_paths = scanner.generate_all_reports(results, formats=report_formats)
+
+            # SARIF is opt-in via --sarif (not part of --format's default bundle)
+            # since it targets GitHub Code Scanning / CI rather than local reading.
+            if args.sarif:
+                report_paths["sarif"] = _generate_sarif_report(scanner, results)
+
+            # SBOM is opt-in via --sbom. It needs a real image to inventory, so
+            # it is skipped (with a note) for compose runs and when no image was
+            # scanned.
+            if args.sbom:
+                if run_compose_analysis or not args.image:
+                    output.warn("--sbom needs a single image (-i); skipping SBOM for this run.")
+                else:
+                    sbom_path = _generate_sbom_report(scanner)
+                    if sbom_path:
+                        report_paths["sbom"] = sbom_path
+
+            # Run advanced scan if available and image is provided (skip for compose
+            # and for --json, since Docker Scout output is not part of the payload
+            # and would otherwise print to stdout alongside it; skip in --offline
+            # since Docker Scout reaches out to Docker's servers)
+            if hasattr(scanner, 'advanced_scan') and args.image and not run_compose_analysis \
+                    and not args.json_stdout and not args.offline:
+                output.section("Advanced scan (Docker Scout)")
+                scanner.advanced_scan()
+
+            scan_ok = True
+            if args.json_stdout:
+                _print_json_results(results, scanner, report_paths)
+            else:
+                _render_scan_summary(output, args, scanner, results, report_paths,
+                                     run_ai, run_compose_analysis)
+
+            # --update-baseline: snapshot current findings and skip gating.
+            if args.update_baseline:
+                from docksec import baseline as baseline_mod
+                baseline_mod.save_baseline(args.baseline, results)
+                output.info(f"Baseline written to {args.baseline}")
+
+            # --fail-on gate: flag findings at or above the chosen threshold.
+            # With --baseline (and not --update-baseline), only findings not
+            # already present in the baseline count toward the gate.
+            if args.fail_on and not args.update_baseline:
+                triggering = _findings_at_or_above(results, args.fail_on)
+                if args.baseline:
+                    from docksec import baseline as baseline_mod
+                    baseline_fingerprints = baseline_mod.load_baseline(args.baseline)
+                    new_ids = {baseline_mod.fingerprint(v) for v in baseline_mod.new_findings(results, baseline_fingerprints)}
+                    triggering = [v for v in triggering if baseline_mod.fingerprint(v) in new_ids]
+                if triggering:
+                    gate_triggered = True
+                    suffix = " (new since baseline)" if args.baseline else ""
+                    output.warn(
+                        f"{len(triggering)} finding(s) at or above {args.fail_on}"
+                        f"{suffix} (--fail-on {args.fail_on}) -> exit 1"
+                    )
+
+        except ValueError as e:
+            # Expected, actionable failures (missing image, missing tools, bad input).
+            output.error(str(e))
+            scan_ok = False
+        except ImportError as e:
+            output.error(f"Scanner modules not found - {e}")
+            sys.exit(3)
+        except Exception as e:
+            output.error(f"Scanner failed: {e}")
+            scan_ok = False
+
+    # AI-only report: when AI analysis ran but no scan did (e.g. a Dockerfile
+    # with no -i image, or --ai-only), the scan block above never generated a
+    # report. Write the AI findings out here so they're available in full,
+    # instead of leaving the user with only the truncated on-screen summary.
+    if run_ai and ai_ok and not run_scan and ai_findings and not args.json_stdout:
+        try:
+            from docksec.docker_scanner import DockerSecurityScanner
+            from datetime import datetime
+
+            ai_results = {
+                "dockerfile_scan": {
+                    "success": True,
+                    "output": "Skipped - AI analysis only",
+                    "skipped": True,
+                },
+                "image_scan": {
+                    "success": True,
+                    "output": "Skipped - AI analysis only",
+                    "skipped": True,
+                },
+                "json_data": [],
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "image_name": "N/A - AI analysis only",
+                "dockerfile_path": args.compose if run_compose_analysis else args.dockerfile,
+                "scan_mode": "compose" if run_compose_analysis else "ai_only",
+                "ai_findings": ai_findings,
+            }
+
+            ai_scanner = DockerSecurityScanner(
+                None, None, results_dir=output_dir, scan_only=True,
+                skip_ai_scoring=args.skip_ai_scoring,
+            )
+            report_paths = ai_scanner.generate_all_reports(ai_results, formats=report_formats)
+            if args.sarif:
+                report_paths["sarif"] = _generate_sarif_report(ai_scanner, ai_results)
+
+            if report_paths:
+                output.report_results(report_paths, output_dir)
+        except Exception as e:
+            output.error(f"Failed to write AI analysis report: {e}")
+            ai_ok = False
+
+    # Exit codes (CI-friendly): 0 clean, 1 findings at/above --fail-on,
+    # 2 usage error, 3 tool/runtime error.
+    if not run_ai and not run_scan:
+        output.warn("No analysis performed. Use --help for usage information.")
+        sys.exit(2)
+
+    if scan_ok is False or ai_ok is False:
+        sys.exit(3)
+
+    if gate_triggered:
+        sys.exit(1)
+
+
+def _generate_sarif_report(scanner, results):
+    """Write a SARIF 2.1.0 report for the scan and return its path.
+
+    Uses ReportGenerator directly (rather than DockerSecurityScanner's
+    generate_all_reports) because SARIF needs the DockSec version embedded in
+    the report and is opt-in via --sarif rather than part of --format's
+    default bundle.
+    """
+    from docksec.report_generator import ReportGenerator
+
+    generator = ReportGenerator(scanner.image_name or "docksec_report", scanner.RESULTS_DIR)
+    generator.set_analysis_score(getattr(scanner, "analysis_score", None))
+    return generator.generate_sarif_report(results, tool_version=get_version())
+
+
+def _generate_sbom_report(scanner):
+    """Generate a CycloneDX SBOM for the scanned image and return its path.
+
+    The BOM is produced by Trivy via the scanner (full package inventory) and
+    written by ReportGenerator with DockSec stamped into the tool metadata.
+    Returns an empty string if the image could not be inventoried.
+    """
+    from docksec.report_generator import ReportGenerator
+
+    sbom_json = scanner.generate_sbom()
+    if not sbom_json:
+        return ""
+    generator = ReportGenerator(scanner.image_name or "docksec_report", scanner.RESULTS_DIR)
+    return generator.generate_cyclonedx_report(sbom_json, tool_version=get_version())
+
+
+def _print_json_results(results, scanner, report_paths):
+    """Print scan results as a single JSON object to stdout.
+
+    Mirrors the shape ReportGenerator.generate_json_report writes to disk, so
+    --json and the JSON report file stay consistent. stdout carries only this
+    payload; all human-readable output goes to stderr in --json mode (see
+    docksec.output.configure).
+    """
+    import json as json_module
+
+    from docksec import output
+
+    vulnerabilities = results.get("json_data", [])
+    payload = {
+        "scan_info": {
+            "image": scanner.image_name,
+            "dockerfile": results.get("dockerfile_path", "N/A"),
+            "scan_time": results.get("timestamp", ""),
+            "analysis_score": getattr(scanner, "analysis_score", None),
+            "scan_mode": results.get("scan_mode", "full"),
+        },
+        "vulnerabilities": vulnerabilities,
+        "severity_counts": output.count_by_severity(vulnerabilities),
+    }
+    if results.get("suppressed_count"):
+        payload["scan_info"]["suppressed_count"] = results["suppressed_count"]
+        payload["scan_info"]["ignore_file"] = results.get("ignore_file")
+    if "ai_findings" in results:
+        payload["ai_analysis"] = results["ai_findings"]
+    if report_paths:
+        payload["report_files"] = {fmt: path for fmt, path in report_paths.items() if path}
+
+    print(json_module.dumps(payload, indent=2))
+
+
+def _render_scan_summary(output, args, scanner, results, report_paths,
+                         run_ai, run_compose_analysis):
+    """Render the consolidated result summary: severity table, score, a Quick
+    take action block, the generated reports, and a suggested next command."""
+    vulnerabilities = results.get("json_data", [])
+    counts = output.count_by_severity(vulnerabilities)
+
+    output.section("Results")
+    output.severity_table(counts)
+    output.score(getattr(scanner, "analysis_score", None))
+    output.quick_take(_quick_take_lines(results, counts, run_ai))
+    output.fix_commands(_suggest_fix_commands(results))
+    if report_paths:
+        output.report_results(report_paths, scanner.RESULTS_DIR)
+    output.next_command(_suggest_next_command(args, results, run_ai, run_compose_analysis))
+
+
+def _quick_take_lines(results, counts, run_ai):
+    """Build a few high-signal lines summarizing what matters most."""
+    lines = []
+
+    vulnerabilities = results.get("json_data", [])
+    total_vulns = sum(counts.get(sev, 0) for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"))
+    if total_vulns:
+        crit, high = counts.get("CRITICAL", 0), counts.get("HIGH", 0)
+        lines.append(f"{total_vulns} security findings ({crit} critical, {high} high)")
+
+        # How many findings have a known fixed version available upstream — a
+        # high-signal, actionable number (mirrors cve-lite's fixable count).
+        fixable = sum(1 for v in vulnerabilities if v.get("FixedVersion"))
+        if fixable:
+            lines.append(f"{fixable} of {total_vulns} have a fixed version available upstream")
+
+    dockerfile_scan = results.get("dockerfile_scan", {})
+    if not dockerfile_scan.get("skipped") and not dockerfile_scan.get("success"):
+        output_text = dockerfile_scan.get("output") or ""
+        issue_lines = [ln for ln in output_text.splitlines() if ln.strip()]
+        if issue_lines:
+            top = _format_hadolint_line(issue_lines[0].strip())
+            lines.append(f"{len(issue_lines)} Dockerfile lint issues; top: {top}")
+
+    ai_findings = results.get("ai_findings") or {}
+    exposed = ai_findings.get("exposed_credentials") or []
+    if exposed:
+        lines.append(f"{len(exposed)} likely exposed credential(s) flagged by AI analysis")
+
+    suppressed = results.get("suppressed_count")
+    if suppressed:
+        lines.append(f"{suppressed} triaged finding(s) suppressed via ignore file")
+
+    if not run_ai and not results.get("ai_findings"):
+        if results.get("scan_mode") == "image_only":
+            lines.append("Add a Dockerfile scan for AI-powered explanations and fixes: docksec <Dockerfile> -i <image>")
+        else:
+            lines.append("Run without --scan-only to add AI-powered explanations and fixes")
+
+    return lines
+
+
+def _findings_at_or_above(results, threshold):
+    """Return the scan findings whose severity is at or above the threshold.
+
+    Operates on the structured findings in ``json_data`` (image vulnerabilities
+    and compose misconfigurations). Hadolint lint warnings are not severity-ranked
+    and do not participate in the --fail-on gate.
+    """
+    from docksec.enums import Severity
+
+    threshold_rank = Severity.rank(threshold)
+    return [
+        v for v in results.get("json_data", [])
+        if Severity.rank(v.get("Severity")) >= threshold_rank
+    ]
+
+
+def _format_hadolint_line(line):
+    """Turn a raw Hadolint line into a compact, path-free summary.
+
+    Input:  '/abs/path/Dockerfile:2 DL3020 error: Use COPY instead of ADD'
+    Output: 'DL3020 error: Use COPY instead of ADD (line 2)'
+    """
+    head, _, rest = line.partition(" ")
+    rest = rest.strip()
+    if not rest:
+        return line
+    line_no = head.rsplit(":", 1)[-1]
+    if line_no.isdigit():
+        return f"{rest} (line {line_no})"
+    return rest
+
+
+def _suggest_fix_commands(results, limit=5):
+    """Build copy-pasteable upgrade hints from findings that have a fixed version.
+
+    Trivy reports the first fixed version per vulnerable package; we surface the
+    most severe fixable packages as concrete 'upgrade PKG to VERSION' lines so a
+    user has an immediate next action, not just a CVE list. Deduplicated by
+    package name (a package can carry several CVEs), most severe first.
+    """
+    from docksec.enums import Severity
+
+    fixable = [v for v in results.get("json_data", []) if v.get("FixedVersion") and v.get("PkgName")]
+    fixable.sort(key=lambda v: Severity.rank(v.get("Severity")), reverse=True)
+
+    seen = set()
+    commands = []
+    for v in fixable:
+        pkg = v.get("PkgName")
+        if pkg in seen:
+            continue
+        seen.add(pkg)
+        installed = v.get("InstalledVersion") or "current"
+        fixed = v.get("FixedVersion")
+        commands.append(f"upgrade {pkg} {installed} -> {fixed}")
+        if len(commands) >= limit:
+            break
+    return commands
+
+
+def _suggest_next_command(args, results, run_ai, run_compose_analysis):
+    """Suggest the most useful follow-up command for the current run."""
+    if run_compose_analysis:
+        return ""
+    dockerfile = getattr(args, "dockerfile", None)
+    # No image was scanned but a Dockerfile is present: suggest adding one.
+    image_skipped = results.get("image_scan", {}).get("skipped")
+    if dockerfile and image_skipped and not args.image:
+        return f"docksec {dockerfile} -i <your-image>:<tag>"
+    return ""
+
+if __name__ == "__main__":
+    main()
