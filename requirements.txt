@@ -1,6 +1,6 @@
 # Core dependencies (scan-only install, no LLM stack)
 pydantic>=2.13,<3
-python-dotenv>=1.0,<2
+python-dotenv>=1.2.2,<2
 colorama>=0.4.6,<1
 rich>=13.0,<16
 fpdf2>=2.8,<3
